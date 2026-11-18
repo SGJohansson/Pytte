@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Build and test (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytte-windows-x64
+          path: target/release/pytte.exe
+          if-no-files-found: error
+
+      # A release is published whenever main carries a Cargo.toml version that has no release
+      # yet: the tag is created here, so nobody has to push one.
+      - name: Read version
+        id: ver
+        shell: bash
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+          if gh release view "v$v" >/dev/null 2>&1; then echo "new=false" >> "$GITHUB_OUTPUT"; else echo "new=true" >> "$GITHUB_OUTPUT"; fi
+          # Release text: docs/releases/v<version>.md if it exists; GitHub's changelog follows it.
+          notes="docs/releases/v$v.md"
+          if [ ! -f "$notes" ]; then notes="$RUNNER_TEMP/notes.md"; : > "$notes"; fi
+          echo "notes=$notes" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Publish release
+        if: github.ref == 'refs/heads/main' && steps.ver.outputs.new == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Pytte ${{ steps.ver.outputs.tag }}
+          body_path: ${{ steps.ver.outputs.notes }}
+          files: target/release/pytte.exe
+          generate_release_notes: true
