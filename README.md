@@ -4,7 +4,7 @@ A multi-tab plaintext editor for Windows where two things come before everything
 
 I built Pytte because Linux is well served by fast editors and Windows mostly is not. The rule from day one: the UI thread never waits for the disk, and nothing that slows down the core gets in until the core is proven.
 
-> **Status:** early prototype (v0.2). Windows 10/11 only. The interface is in Swedish.
+> **Status:** early prototype (v0.3). Windows 10/11 only. The interface is in Swedish.
 
 ## Features
 
@@ -12,10 +12,11 @@ I built Pytte because Linux is well served by fast editors and Windows mostly is
 - **Line numbers without the wait** — a line index is counted on its own thread, 64 KiB at a time, and published lock-free; the first MiB is counted before the tab is shown, so ordinary files have exact numbers on the first frame. A gigabyte is indexed in a fraction of a second; until then the gutter shows `~` and the status bar the progress. The UI thread never scans the file, and the gutter only ever grows, so the layout never jumps.
 - **Search** — `Ctrl+F` searches as you type, on a worker thread that can be cancelled, with matches streamed back and highlighted on screen. SIMD substring search; case-insensitive mode folds ASCII and Latin-1 (`åäö`, `é`, `ü`). Matches that straddle edits are found too.
 - **Line operations** — duplicate, move and delete whole lines; each is a single undo step.
+- **Reading aids** — the current line is faintly highlighted and the bracket matching the one at the cursor is boxed; the search is capped at 64 KiB each way, so it never scans a large file.
 - **Status bar** — saved/changed state, line and column, line count, selection size, line endings and file size. Segments shorten or drop out in order of importance rather than overlap; nothing is ever drawn on top of text.
 - **Crash-proof sessions** — every edit is appended to a per-tab write-ahead log on its own thread, written through to disk, with a CRC on every record. Close the window and nothing is asked: tabs, cursor positions and unsaved text are restored on the next start. A torn last record after a power cut is detected and cut off.
 - **Safe saves** — written to a temporary file, flushed, then swapped in with `ReplaceFileW`, so the file on disk is always either the old or the new version, never half of each.
-- **Tabs** — open as many as you like; switching is O(1) and only the visible lines are ever drawn. Opening a file that is already open just switches to it.
+- **Tabs** — open as many as you like; switching is O(1) and only the visible lines are ever drawn. Opening a file that is already open just switches to it. The tab bar always keeps the active tab in view, with `‹N` and `+N` for tabs scrolled out of sight; closed tabs can be reopened where you left them.
 - **UTF-8** — `åäö`, `€`, `§` and emoji type and render correctly; the cursor and `Backspace` move one whole character at a time, so a character can never be split. Invalid bytes are shown as `·` and left untouched. CRLF and LF are detected per file and kept.
 - **Selection, clipboard, undo** — `Shift` with any movement key, mouse drag, `Ctrl+A`; cut, copy and paste; undo and redo grouped by word. Undo keeps references to the removed text rather than copies, so undoing a `Ctrl+A`, `Delete` on a huge file costs next to nothing.
 - **One instance owns the session** — running `pytte.exe file.txt` while Pytte is open hands the file to the running window as a new tab.
@@ -32,7 +33,10 @@ I built Pytte because Linux is well served by fast editors and Windows mostly is
 | `Ctrl+Shift+S` | Save as |
 | `Ctrl+N` | New tab |
 | `Ctrl+W` / `Ctrl+F4` / middle-click a tab | Close tab (asks only if there are unsaved changes) |
-| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` · `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous tab |
+| `Ctrl+1` … `Ctrl+8` · `Ctrl+9` | Tab 1–8 · last tab |
+| `Ctrl+Shift+PgUp` / `Ctrl+Shift+PgDn` | Move the tab left / right |
+| `Ctrl+Shift+T` | Reopen the last closed tab |
 | Close the window | Nothing is asked; the session is restored on the next start |
 
 **Moving** (add `Shift` to select)
@@ -43,6 +47,7 @@ I built Pytte because Linux is well served by fast editors and Windows mostly is
 | `↑` `↓` · `PgUp` `PgDn` | Line · page |
 | `Home` `End` / `Ctrl+Home` `Ctrl+End` | Start/end of line / of file |
 | Click · drag · `Shift`+click | Place the cursor · select · extend the selection |
+| Double-click · triple-click | Select word · select line |
 | Mouse wheel | Scroll |
 | `Ctrl+A` · `Esc` | Select all · clear the selection |
 | `Ctrl+G` | Go to line |
@@ -119,7 +124,7 @@ How it avoids losing data:
 - Saving still runs on the UI thread; saving a multi-gigabyte file freezes the window for a few seconds.
 - Lines that are several gigabytes long are slow to move around in, and the column number is counted from the start of the line.
 - Case-insensitive search folds ASCII and Latin-1 only; regular expressions are not supported yet.
-- No word wrap or double-click word selection yet.
+- No word wrap yet.
 
 ## Roadmap
 

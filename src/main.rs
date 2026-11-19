@@ -41,6 +41,7 @@ const WM_LOADED: u32 = WM_APP + 1;
 const WM_SEARCH: u32 = WM_APP + 2;
 /// Synkront sökfönster runt markören (för omedelbart svar innan bakgrundssökningen hunnit dit).
 const LOCAL_WIN: usize = 1 << 20;
+const CLOSED_MAX: usize = 50;
 const FIND_HINT: &str = "ENTER/F3 NÄSTA  SHIFT+ENTER FÖRRA  ALT+C Aa  ESC STÄNG";
 const GOTO_HINT: &str = "ENTER GÅ  ESC STÄNG";
 const CF_UNICODETEXT: u32 = 13;
@@ -121,6 +122,10 @@ struct App {
     search: Search,
     /// Sökartråden har postat WM_SEARCH som UI ännu inte hämtat.
     posted: Arc<AtomicBool>,
+    /// Stängda flikar med sökväg: (sökväg, markör, top). Senaste sist.
+    closed: Vec<(String, usize, usize)>,
+    /// Klickräkning för dubbel-/trippelklick: (tid ms, x, y, antal).
+    clicks: (u32, f32, f32, u8),
 }
 
 impl App {
@@ -257,11 +262,33 @@ impl App {
         }
     }
 
+    /// Lägsta lediga visningsnummer bland öppna namnlösa flikar.
+    fn free_no(&self) -> u64 {
+        let mut used: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter(|t| t.path.is_none())
+            .map(|t| t.no)
+            .collect();
+        used.sort_unstable();
+        let mut n = 1;
+        for u in used {
+            if u == n {
+                n += 1;
+            } else if u > n {
+                break;
+            }
+        }
+        n
+    }
+
     fn new_tab(&mut self) {
         let id = self.next_id;
         self.next_id += 1;
         self.wal.send(Msg::Reset(id, wal::rec_header(0, 0, None)));
-        self.tabs.push(Tab::new(id, None, Doc::empty()));
+        let mut t = Tab::new(id, None, Doc::empty());
+        t.no = self.free_no();
+        self.tabs.push(t);
         self.active = self.tabs.len() - 1;
         self.structural();
     }
@@ -315,8 +342,70 @@ impl App {
 
     fn close(&mut self, i: usize) {
         if i < self.tabs.len() {
+            let t = &self.tabs[i];
+            // Sista fliken som redan är tom och namnlös: att stänga den skulle bara
+            // skapa en likadan (ny WAL-fil och nytt nummer per tangentrepetition).
+            if self.tabs.len() == 1
+                && t.path.is_none()
+                && !t.dirty
+                && !t.loading
+                && t.doc.len() == 0
+            {
+                return;
+            }
+            if let Some(p) = &t.path {
+                self.closed.push((p.clone(), t.cursor, t.top));
+                if self.closed.len() > CLOSED_MAX {
+                    self.closed.remove(0);
+                }
+            }
             self.drop_tab(i);
         }
+    }
+
+    /// Ctrl+Shift+T: återöppnar senast stängda flik på samma markörposition.
+    fn reopen_closed(&mut self) {
+        let Some((path, cursor, top)) = self.closed.pop() else {
+            self.set_status("INGA STÄNGDA FLIKAR ATT ÅTERÖPPNA", false);
+            return;
+        };
+        let before = self.tabs.len();
+        self.open_path(&path);
+        // Ny flik laddas asynkront; clamp() vid laddning håller positionerna giltiga.
+        if self.tabs.len() > before {
+            let t = self.tab();
+            t.cursor = cursor;
+            t.top = top;
+        }
+    }
+
+    /// Ctrl+Shift+PgUp/PgDn: flyttar aktiv flik ett steg (ingen wrap).
+    fn move_tab(&mut self, right: bool) {
+        let a = self.active;
+        let j = if right {
+            if a + 1 >= self.tabs.len() {
+                return;
+            }
+            a + 1
+        } else {
+            if a == 0 {
+                return;
+            }
+            a - 1
+        };
+        self.tabs.swap(a, j);
+        self.active = j;
+        self.structural();
+    }
+
+    fn cycle_tab(&mut self, forward: bool) {
+        let n = self.tabs.len();
+        let i = if forward {
+            (self.active + 1) % n
+        } else {
+            (self.active + n - 1) % n
+        };
+        self.switch(i);
     }
 
     /// Sparar flik `i` till `path` (eller dess befintliga sökväg).
@@ -462,9 +551,32 @@ impl App {
         self.edit(None, s.as_bytes(), Kind::Other);
     }
 
-    fn on_key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool) -> Option<Cmd> {
-        // Globala: sök/gå till rad fungerar oavsett fokus.
+    fn on_key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool, alt: bool) -> Option<Cmd> {
+        // Globala: flikar, sök och gå till rad fungerar oavsett fokus.
         match vk {
+            VK_PRIOR | VK_NEXT if ctrl => {
+                if shift {
+                    self.move_tab(vk == VK_NEXT);
+                } else {
+                    self.cycle_tab(vk == VK_NEXT);
+                }
+                return None;
+            }
+            VK_T if ctrl && shift => {
+                self.reopen_closed();
+                return None;
+            }
+            // Ctrl+1–8: flik 1–8, Ctrl+9: sista. Inte med Alt: AltGr = Ctrl+Alt ger
+            // @ £ $ { [ ] } på svenskt tangentbord.
+            v if ctrl && !alt && !shift && (0x31..=0x39).contains(&v.0) => {
+                let k = (v.0 - 0x31) as usize;
+                let n = self.tabs.len();
+                let i = if k == 8 { n - 1 } else { k };
+                if i < n {
+                    self.switch(i);
+                }
+                return None;
+            }
             VK_F if ctrl => {
                 self.open_bar(BarMode::Find);
                 return None;
@@ -605,13 +717,7 @@ impl App {
                 return None;
             }
             VK_TAB if ctrl => {
-                let n = self.tabs.len();
-                let i = if shift {
-                    (self.active + n - 1) % n
-                } else {
-                    (self.active + 1) % n
-                };
-                self.switch(i);
+                self.cycle_tab(!shift);
                 return None;
             }
             VK_N if ctrl => {
@@ -1150,15 +1256,43 @@ impl App {
             return;
         }
         let pos = self.hit(x, y);
+        // Dubbel-/trippelklick: samma ställe inom systemets dubbelklickstid.
+        let now = unsafe { GetMessageTime() } as u32;
+        let (t0, cx, cy, n) = self.clicks;
+        let near = (x - cx).abs() <= 4.0 && (y - cy).abs() <= 4.0;
+        let count = if !shift && near && now.wrapping_sub(t0) <= unsafe { GetDoubleClickTime() } {
+            n % 3 + 1
+        } else {
+            1
+        };
+        self.clicks = (now, x, y, count);
         let t = self.tab();
         t.seal();
+        t.want = None;
+        match count {
+            2 => {
+                let (a, z) = t.doc.word_at(pos);
+                t.anchor = Some(a);
+                t.cursor = z;
+                self.follow();
+                return;
+            }
+            3 => {
+                let a = t.doc.line_start(pos);
+                let z = t.doc.next_line_start(pos).unwrap_or(t.doc.len());
+                t.anchor = Some(a);
+                t.cursor = z;
+                self.follow();
+                return;
+            }
+            _ => {}
+        }
         if shift {
             t.anchor.get_or_insert(t.cursor);
         } else {
             t.anchor = Some(pos);
         }
         t.cursor = pos;
-        t.want = None;
         self.dragging = true;
         unsafe {
             SetCapture(self.hwnd);
@@ -1466,8 +1600,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             return LRESULT(0);
         }
         WM_KEYDOWN => {
-            let cmd =
-                with_app(|a| a.on_key(VIRTUAL_KEY(wp.0 as u16), down(VK_CONTROL), down(VK_SHIFT)));
+            let cmd = with_app(|a| {
+                a.on_key(
+                    VIRTUAL_KEY(wp.0 as u16),
+                    down(VK_CONTROL),
+                    down(VK_SHIFT),
+                    down(VK_MENU),
+                )
+            });
             if let Some(c) = cmd {
                 run_cmd(hwnd, c);
             }
@@ -1630,11 +1770,25 @@ fn main() -> Result<()> {
 
     let hwnd = unsafe {
         let inst = GetModuleHandleW(None)?;
+        // Ikonresurs 1 bäddas in av build.rs. Saknas den blir det Windows standardikon.
+        let icon = PCWSTR(std::ptr::without_provenance(1)); // MAKEINTRESOURCE(1)
+        let small = LoadImageW(
+            Some(inst.into()),
+            icon,
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_DEFAULTCOLOR,
+        )
+        .map(|h| HICON(h.0))
+        .unwrap_or_default();
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wndproc),
             hInstance: inst.into(),
+            hIcon: LoadIconW(Some(inst.into()), icon).unwrap_or_default(),
+            hIconSm: small,
             hCursor: LoadCursorW(None, IDC_IBEAM)?,
             lpszClassName: CLASS,
             ..Default::default()
@@ -1702,9 +1856,15 @@ fn main() -> Result<()> {
             origin: 0,
         },
         posted: Arc::new(AtomicBool::new(false)),
+        closed: Vec::new(),
+        clicks: (0, 0.0, 0.0, 0),
     };
     for (id, job) in rec.jobs {
         app.spawn(id, job);
+    }
+    // Återställda namnlösa flikar numreras 1, 2, 3 … i flikordning.
+    for (k, t) in app.tabs.iter_mut().filter(|t| t.path.is_none()).enumerate() {
+        t.no = k as u64 + 1;
     }
     for a in args() {
         let p = std::fs::canonicalize(&a)
