@@ -30,6 +30,19 @@ pub struct Group {
 }
 
 const UNDO_MAX: usize = 10_000;
+/// Radoperationer kopierar blocket; större block vägras hellre än att frysa UI.
+pub const LINE_OP_MAX: usize = 64 << 20;
+
+/// Delar upp i (innehåll, terminator) där terminatorn är "\r\n", "\n" eller tom.
+fn split_term(b: &[u8]) -> (&[u8], &[u8]) {
+    if b.ends_with(b"\r\n") {
+        b.split_at(b.len() - 2)
+    } else if b.ends_with(b"\n") {
+        b.split_at(b.len() - 1)
+    } else {
+        (b, &[])
+    }
+}
 
 // ---------------------------------------------------------------- flik
 
@@ -46,6 +59,8 @@ pub struct Tab {
     pub dirty: bool,
     pub crlf: bool,
     pub loading: bool,
+    /// Gutterns sifferbredd. Växer bara (aldrig layouthopp nedåt).
+    pub gutter: usize,
     undo: Vec<Group>,
     redo: Vec<Group>,
     /// Nästa redigering startar en ny ångra-grupp.
@@ -67,6 +82,7 @@ impl Tab {
             dirty: false,
             crlf,
             loading: false,
+            gutter: 0,
             undo: Vec::new(),
             redo: Vec::new(),
             sealed: true,
@@ -280,6 +296,146 @@ impl Tab {
             }
         }
         self.sealed = kind == Kind::Other;
+    }
+
+    // ------------------------------------------------------------ radoperationer
+
+    /// [s, e): hela rader som täcks av markering/markör. En markering som slutar
+    /// precis i en radstart tar inte med den raden.
+    fn line_block(&self) -> (usize, usize) {
+        let d = &self.doc;
+        let (a, z) = self.sel().unwrap_or((self.cursor, self.cursor));
+        let s = d.line_start(a);
+        let last = if z > a && z > s && d.line_start(z) == z {
+            z - 1
+        } else {
+            z
+        };
+        (s, d.next_line_start(last).unwrap_or(d.len()))
+    }
+
+    /// Ersätter [a, b) och placerar markör/ankare; ett ångra-steg.
+    fn line_edit(
+        &mut self,
+        wal: &Wal,
+        a: usize,
+        b: usize,
+        ins: &[u8],
+        cursor: usize,
+        anchor: Option<usize>,
+    ) {
+        self.replace(wal, a, b, ins, Kind::Other);
+        self.cursor = cursor.min(self.doc.len());
+        self.anchor = anchor.map(|x| x.min(self.doc.len()));
+        if let Some(g) = self.undo.last_mut() {
+            g.after = self.cursor;
+        }
+    }
+
+    fn too_big(n: usize) -> Result<(), String> {
+        if n > LINE_OP_MAX {
+            Err(format!(
+                "RADBLOCKET ÄR FÖR STORT (> {} MB)",
+                LINE_OP_MAX >> 20
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Ctrl+D: duplicerar raden/raderna under markören. Markören står kvar.
+    pub fn duplicate_lines(&mut self, wal: &Wal) -> Result<(), String> {
+        if self.loading {
+            return Ok(());
+        }
+        let (s, e) = self.line_block();
+        Self::too_big(e - s)?;
+        let blk = self.doc.slice(s, e);
+        let (core, term) = split_term(&blk);
+        let ins = if term.is_empty() {
+            let nl: &[u8] = if self.crlf { b"\r\n" } else { b"\n" };
+            [nl, core].concat()
+        } else {
+            blk.clone()
+        };
+        let (c, a) = (self.cursor, self.anchor);
+        self.line_edit(wal, e, e, &ins, c, a);
+        Ok(())
+    }
+
+    /// Alt+Upp/Ned: flyttar raden/raderna förbi grannraden. Markering följer med.
+    pub fn move_lines(&mut self, wal: &Wal, down: bool) -> Result<(), String> {
+        if self.loading {
+            return Ok(());
+        }
+        let d = &self.doc;
+        let (s, e) = self.line_block();
+        let (r0, r1, first, second) = if down {
+            if e >= d.len() {
+                return Ok(());
+            }
+            let e2 = d.next_line_start(e).unwrap_or(d.len());
+            Self::too_big(e2 - s)?;
+            (s, e2, d.slice(s, e), d.slice(e, e2))
+        } else {
+            if s == 0 {
+                return Ok(());
+            }
+            let p0 = d.line_start(s - 1);
+            Self::too_big(e - p0)?;
+            (p0, e, d.slice(p0, s), d.slice(s, e))
+        };
+        // second hamnar före first; varje del behåller sin terminatorposition.
+        let (fc, ft) = split_term(&first);
+        let (sc, st) = split_term(&second);
+        let new = [sc, ft, fc, st].concat();
+        // Blockets positioner: [s, s+bc] → nytt läge, terminator/slut → efter blocket.
+        let map = |p: usize| -> usize {
+            if down {
+                if p - s <= fc.len() {
+                    r0 + sc.len() + ft.len() + (p - s)
+                } else {
+                    r0 + new.len()
+                }
+            } else if p - s <= sc.len() {
+                r0 + (p - s)
+            } else {
+                r0 + new.len()
+            }
+        };
+        let (c, a) = (map(self.cursor), self.anchor.map(map));
+        self.line_edit(wal, r0, r1, &new, c, a);
+        self.want = None;
+        Ok(())
+    }
+
+    /// Ctrl+Shift+K: raderar raden/raderna; markören behåller kolumnen.
+    pub fn delete_lines(&mut self, wal: &Wal) {
+        if self.loading {
+            return;
+        }
+        let d = &self.doc;
+        let vc = d.vcol(self.cursor);
+        let (s, e) = self.line_block();
+        // Sista raden utan terminator: ta föregående radslut istället.
+        let a = if e == d.len() && s > 0 && d.byte(e.saturating_sub(1)) != Some(b'\n') {
+            if s >= 2 && d.byte(s - 2) == Some(b'\r') {
+                s - 2
+            } else {
+                s - 1
+            }
+        } else {
+            s
+        };
+        if a == e {
+            return;
+        }
+        self.replace(wal, a, e, b"", Kind::Other);
+        let ls = self.doc.line_start(a.min(self.doc.len()));
+        self.cursor = self.doc.pos_at_vcol(ls, vc);
+        if let Some(g) = self.undo.last_mut() {
+            g.after = self.cursor;
+        }
     }
 
     fn apply_inverse(&mut self, wal: &Wal, g: Group) -> Group {

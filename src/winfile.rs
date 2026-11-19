@@ -8,6 +8,8 @@ use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::Memory::*;
 use windows::core::PCWSTR;
 
+use crate::orig::{self, Orig, Store};
+
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -27,8 +29,17 @@ pub struct Mapping {
     len: usize,
 }
 
-// Vyn är read-only och handtagen är processglobala; säkert att flytta mellan trådar.
+// Vyn är read-only och handtagen är processglobala; säkert att dela mellan trådar
+// (indextråd och sökning läser samtidigt som UI-tråden).
 unsafe impl Send for Mapping {}
+unsafe impl Sync for Mapping {}
+
+impl Mapping {
+    #[inline]
+    pub fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.view.Value as *const u8, self.len) }
+    }
+}
 
 impl Drop for Mapping {
     fn drop(&mut self) {
@@ -36,26 +47,6 @@ impl Drop for Mapping {
             let _ = UnmapViewOfFile(self.view);
             let _ = CloseHandle(self.map);
             let _ = CloseHandle(self.file);
-        }
-    }
-}
-
-pub enum Orig {
-    Empty,
-    Mapped(Mapping),
-    /// Fallback när filen redan är öppen för skrivning av någon annan.
-    Owned(Vec<u8>),
-}
-
-impl Orig {
-    #[inline]
-    pub fn bytes(&self) -> &[u8] {
-        match self {
-            Orig::Empty => &[],
-            Orig::Mapped(m) => unsafe {
-                std::slice::from_raw_parts(m.view.Value as *const u8, m.len)
-            },
-            Orig::Owned(v) => v,
         }
     }
 }
@@ -72,7 +63,7 @@ pub fn open_orig(path: &str) -> io::Result<(Orig, (u64, u64))> {
             let mut v = Vec::with_capacity(len as usize);
             f.take(len).read_to_end(&mut v)?;
             let n = v.len() as u64;
-            Ok((Orig::Owned(v), (n, mtime)))
+            Ok((orig::owned(v), (n, mtime)))
         }
     }
 }
@@ -97,7 +88,7 @@ fn map_file(path: &str) -> io::Result<Orig> {
         }
         if size == 0 {
             let _ = CloseHandle(file);
-            return Ok(Orig::Empty);
+            return Ok(orig::empty());
         }
         let map = match CreateFileMappingW(file, None, PAGE_READONLY, 0, 0, PCWSTR::null()) {
             Ok(m) => m,
@@ -112,12 +103,12 @@ fn map_file(path: &str) -> io::Result<Orig> {
             let _ = CloseHandle(file);
             return Err(io::Error::last_os_error());
         }
-        Ok(Orig::Mapped(Mapping {
+        Ok(orig::make(Store::Mapped(Mapping {
             file,
             map,
             view,
             len: size as usize,
-        }))
+        })))
     }
 }
 
