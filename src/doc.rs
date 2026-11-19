@@ -16,6 +16,10 @@ const UNK: u64 = u64::MAX;
 const DIRECT: usize = 2 * CH;
 /// Budget för rå radslutsskanning när indexet ännu inte nått fram (render).
 pub const SCAN_BUDGET: usize = 4 << 20;
+/// Dubbelklick markerar högst så här långt åt vardera håll.
+const WORD_SCAN: usize = 4096;
+/// Parentesmatchning söker högst så här långt åt vardera håll.
+pub const BRACKET_SCAN: usize = 64 << 10;
 
 #[derive(Clone, Copy)]
 struct Piece {
@@ -886,6 +890,72 @@ impl Doc {
         p
     }
 
+    /// Ordet (eller sjoken av blanktecken/skiljetecken) under `pos` för dubbelklick.
+    /// Står pos precis efter ett ord räknas det ordet. Begränsat till WORD_SCAN.
+    pub fn word_at(&self, pos: usize) -> (usize, usize) {
+        let here = self.byte(pos).filter(|&b| class(b) != 1);
+        let before = (pos > 0).then(|| self.byte(pos - 1)).flatten();
+        let c = match (here, before) {
+            (Some(b), Some(p)) if class(b) != 2 && class(p) == 2 => 2,
+            (Some(b), _) => class(b),
+            (None, Some(p)) if class(p) != 1 => class(p),
+            _ => return (pos, pos),
+        };
+        let a = pos
+            - self
+                .back(pos)
+                .take(WORD_SCAN)
+                .take_while(|&b| class(b) == c)
+                .count();
+        let z = pos
+            + self
+                .fwd(pos)
+                .take(WORD_SCAN)
+                .take_while(|&b| class(b) == c)
+                .count();
+        (a, z)
+    }
+
+    /// Matchande parentes för den vid markören (eller precis före).
+    /// Returnerar (parentes vid markören, dess partner). Begränsad sökning.
+    pub fn match_bracket(&self, cursor: usize) -> Option<(usize, usize)> {
+        const PAIRS: [(u8, u8); 3] = [(b'(', b')'), (b'[', b']'), (b'{', b'}')];
+        let cands = [Some(cursor), cursor.checked_sub(1)];
+        for p in cands.into_iter().flatten() {
+            let Some(b) = self.byte(p) else { continue };
+            for (open, close) in PAIRS {
+                let mut depth = 0usize;
+                if b == open {
+                    for (k, x) in self.fwd(p + 1).take(BRACKET_SCAN).enumerate() {
+                        if x == open {
+                            depth += 1;
+                        } else if x == close {
+                            if depth == 0 {
+                                return Some((p, p + 1 + k));
+                            }
+                            depth -= 1;
+                        }
+                    }
+                    return None;
+                }
+                if b == close {
+                    for (k, x) in self.back(p).take(BRACKET_SCAN).enumerate() {
+                        if x == close {
+                            depth += 1;
+                        } else if x == open {
+                            if depth == 0 {
+                                return Some((p, p - 1 - k));
+                            }
+                            depth -= 1;
+                        }
+                    }
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
     /// CRLF om första radslutet är CRLF eller om filen saknar radslut.
     pub fn detect_crlf(&self) -> bool {
         let mut prev = 0u8;
@@ -1136,6 +1206,26 @@ mod tests {
                 assert_eq!(d.pos_of_line(want_line), Some(ls), "pos_of_line");
             }
         }
+    }
+
+    #[test]
+    fn words_and_brackets() {
+        let d = doc("hej på dig, (a[b]{c}) )".as_bytes());
+        assert_eq!(d.word_at(1), (0, 3));
+        assert_eq!(d.word_at(3), (0, 3)); // precis efter ordet
+        assert_eq!(d.word_at(4), (4, 7)); // "på" med å
+        let s = "hej på dig, (a[b]{c}) )".as_bytes();
+        let open = s.iter().position(|&b| b == b'(').unwrap();
+        let close = s.iter().rposition(|&b| b == b')').unwrap() - 2;
+        assert_eq!(d.match_bracket(open), Some((open, close)));
+        assert_eq!(d.match_bracket(close + 1), Some((close, open)));
+        let lb = open + 2;
+        assert_eq!(d.match_bracket(lb), Some((lb, lb + 2)));
+        assert_eq!(d.match_bracket(s.len()), None); // ensam ')'
+        assert_eq!(d.match_bracket(0), None);
+        let e = doc(b"ab\ncd");
+        assert_eq!(e.word_at(2), (0, 2));
+        assert_eq!(e.word_at(3), (3, 5));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "pytte"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A crash-proof multi-tab plaintext editor for Windows, built for raw speed"
 license = "MIT"
@@ -9,6 +9,9 @@ authors = ["S.G. Johansson"]
 
 [dependencies]
 memchr = "2"
+
+[build-dependencies]
+winresource = "0.1"
 
 [dependencies.windows]
 version = "0.62"

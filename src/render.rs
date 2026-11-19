@@ -118,6 +118,7 @@ struct Brushes {
     badge_g: ID2D1SolidColorBrush,
     badge_r: ID2D1SolidColorBrush,
     badge_t: ID2D1SolidColorBrush,
+    cur_line: ID2D1SolidColorBrush,
 }
 
 struct Res {
@@ -135,6 +136,8 @@ pub struct Gfx {
     logo_w: f32,
     pub dpi: f32,
     res: Option<Res>,
+    /// Första synliga flik i flikraden (klistrig: ändras bara när aktiv flik annars döljs).
+    tab_first: usize,
 }
 
 /// Sökradens innehåll (byggs av App).
@@ -248,6 +251,7 @@ impl Gfx {
                 logo_w,
                 dpi: GetDpiForWindow(hwnd).max(96) as f32,
                 res: None,
+                tab_first: 0,
             })
         }
     }
@@ -362,6 +366,7 @@ impl Gfx {
                 badge_g: br(GREEN, 0.13)?,
                 badge_r: br(RED2, 0.18)?,
                 badge_t: br(TEXT, 0.10)?,
+                cur_line: br(GREEN, 0.05)?,
             };
             Ok(Res { rt, b })
         }
@@ -429,6 +434,7 @@ impl Gfx {
         }
         let t = &tabs[active];
         let l = self.layout(hwnd, t.gutter, v.bar.is_some());
+        self.tab_first = self.tab_window(&l, tabs, active);
         let res = self.res.as_ref().unwrap();
         let rt = &res.rt;
         let hits;
@@ -449,6 +455,96 @@ impl Gfx {
     }
 
     // ------------------------------------------------------------ flikrad
+
+    /// Fliktitel, kapad så att en enskild flik aldrig kan tränga undan resten.
+    fn tab_title(t: &Tab) -> String {
+        const MAX: usize = 40;
+        let s = t.title();
+        if s.chars().count() <= MAX {
+            s
+        } else {
+            s.chars()
+                .take(MAX - 1)
+                .chain(std::iter::once('…'))
+                .collect()
+        }
+    }
+
+    fn tab_w(&self, t: &Tab) -> f32 {
+        (Self::tab_title(t).chars().count() as f32 + if t.dirty { 2.0 } else { 0.0 }) * self.cw
+            + 28.0
+    }
+
+    fn more_w(&self, s: &str) -> f32 {
+        (s.chars().count() as f32 + 1.0) * self.cw + 12.0
+    }
+
+    fn show_logo(&self, l: &Layout) -> (bool, f32) {
+        let lx = l.w - l.x0 - self.logo_w - self.cw * 9.0;
+        (lx > l.x0 + self.cw * 16.0, lx)
+    }
+
+    fn tab_limit(&self, l: &Layout) -> f32 {
+        match self.show_logo(l) {
+            (true, lx) => lx - 24.0,
+            (false, _) => l.w - l.x0,
+        }
+    }
+
+    /// Första synliga flik så att den aktiva alltid syns. Behåller föregående läge
+    /// om det räcker; annars läggs aktiv flik längst till höger (eller vänster när
+    /// man går bakåt). Kostar O(synliga flikar) oavsett antal flikar.
+    fn tab_window(&self, l: &Layout, tabs: &[Tab], active: usize) -> usize {
+        let n = tabs.len();
+        if n == 0 {
+            return 0;
+        }
+        let start = l.x0 - 8.0;
+        let limit = self.tab_limit(l);
+        let right = |i: usize| {
+            if i + 1 < n {
+                self.more_w(&format!("+{}", n - i - 1))
+            } else {
+                0.0
+            }
+        };
+        let left = |f: usize| {
+            if f > 0 {
+                self.more_w(&format!("‹{f}"))
+            } else {
+                0.0
+            }
+        };
+        let prev = self.tab_first;
+        if prev <= active {
+            let mut x = start + left(prev);
+            let mut ok = true;
+            for t in &tabs[prev..=active] {
+                x += self.tab_w(t) + 4.0;
+                if x > limit {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok && x - 4.0 + right(active) <= limit {
+                return prev;
+            }
+        } else {
+            return active;
+        }
+        // Bakåt från aktiv flik tills raden är full.
+        let mut used = self.tab_w(&tabs[active]) + right(active);
+        let mut first = active;
+        while first > 0 {
+            let w = self.tab_w(&tabs[first - 1]) + 4.0;
+            if start + left(first - 1) + used + w > limit {
+                break;
+            }
+            used += w;
+            first -= 1;
+        }
+        first
+    }
 
     unsafe fn draw_tabs(
         &self,
@@ -472,10 +568,8 @@ impl Gfx {
         }
 
         // logga (döljs hellre än att krocka med flikarna i smala fönster)
-        let sub_w = self.cw * 9.0;
-        let lx = l.w - l.x0 - self.logo_w - sub_w;
         let ty = (l.tab_h - self.lh) / 2.0;
-        let show_logo = lx > l.x0 + self.cw * 16.0;
+        let (show_logo, lx) = self.show_logo(l);
         if show_logo {
             self.text(rt, &utf16("VoidFlow"), lx, ty - 1.0, &self.bold, &b.green);
             self.text(rt, &utf16(" //"), lx + self.logo_w, ty, &self.mono, &b.red2);
@@ -489,21 +583,30 @@ impl Gfx {
             );
         }
 
+        let first = self.tab_first.min(tabs.len().saturating_sub(1));
         let mut x = l.x0 - 8.0;
-        let limit = if show_logo { lx - 24.0 } else { l.w - l.x0 };
-        for (i, t) in tabs.iter().enumerate() {
-            let title = t.title();
-            let tw =
-                (title.chars().count() as f32 + if t.dirty { 2.0 } else { 0.0 }) * self.cw + 28.0;
+        let limit = self.tab_limit(l);
+        // Dolda flikar till vänster: "‹N", klick väljer närmaste dolda.
+        if first > 0 {
+            let s = format!("‹{first}");
+            let w = self.more_w(&s);
+            self.text(rt, &utf16(&s), x + 6.0, ty, &self.mono, &b.muted);
+            hits.push((x, x + w, first - 1));
+            x += w;
+        }
+        for (i, t) in tabs.iter().enumerate().skip(first) {
+            let title = Self::tab_title(t);
+            let tw = self.tab_w(t);
             // Reservera plats för "+N" så att räknaren aldrig hamnar under loggan.
             let more = format!("+{}", tabs.len() - i);
             let reserve = if i + 1 < tabs.len() {
-                (more.len() as f32 + 1.0) * self.cw + 12.0
+                self.more_w(&more)
             } else {
                 0.0
             };
-            if x + tw + reserve > limit {
+            if x + tw + reserve > limit && i != active {
                 self.text(rt, &utf16(&more), x + 6.0, ty, &self.mono, &b.muted);
+                hits.push((x, x + self.more_w(&more), i));
                 break;
             }
             unsafe {
@@ -513,10 +616,12 @@ impl Gfx {
                 }
             }
             let fg = if i == active { &b.green } else { &b.muted };
-            self.text(rt, &utf16(&title), x + 14.0, ty, &self.mono, fg);
+            self.text_clip(rt, &title, x + 14.0, ty, x + tw - 4.0, &self.mono, fg);
             if t.dirty {
                 let dx = x + 14.0 + (title.chars().count() as f32 + 1.0) * self.cw;
-                self.text(rt, &utf16("\u{25CF}"), dx, ty, &self.mono, &b.red2);
+                if dx + self.cw <= x + tw {
+                    self.text(rt, &utf16("\u{25CF}"), dx, ty, &self.mono, &b.red2);
+                }
             }
             hits.push((x, x + tw, i));
             x += tw + 4.0;
@@ -557,6 +662,13 @@ impl Gfx {
         let top_line = d.line_of(t.top);
         let cur_line = d.line_of(t.cursor);
         let sel = t.sel();
+        // Matchande parenteser (endast utan markering), ritas som ram runt tecknet.
+        let br = if sel.is_none() {
+            d.match_bracket(t.cursor)
+        } else {
+            None
+        };
+        let mut br_cells: Vec<(usize, usize)> = Vec::with_capacity(2);
         let mlen = matcher.map_or(0, |m| m.len());
         let mut ls = t.top;
         let mut cursor_row = None;
@@ -579,6 +691,11 @@ impl Gfx {
             let unknown = matches!(nx, Next::Unknown);
             if t.cursor >= ls && next.is_none_or(|n| t.cursor < n) {
                 cursor_row = Some(row);
+                if sel.is_none() {
+                    unsafe {
+                        rt.FillRectangle(&rect(l.sep + 1.0, ry, l.w, ry + self.lh), &b.cur_line);
+                    }
+                }
             }
 
             // ---- radnummer
@@ -624,6 +741,12 @@ impl Gfx {
                     if s0.is_some() && s1.is_none() && p >= z {
                         s1 = Some(c);
                     }
+                }
+                if let Some((p0, p1)) = br
+                    && (p == p0 || p == p1)
+                    && c >= t.hscroll
+                {
+                    br_cells.push((row, c));
                 }
                 while mi < mr.len() {
                     let (ms, me) = mr[mi];
@@ -728,6 +851,20 @@ impl Gfx {
                     }
                     break;
                 }
+            }
+        }
+
+        // ---- parentesramar (fyllning + 1 px kant; tecknet syns igenom)
+        for &(row, c) in &br_cells {
+            let x0 = l.tx + (c - t.hscroll) as f32 * self.cw;
+            let y0 = l.y0 + row as f32 * self.lh + 1.0;
+            let (x1, y1) = (x0 + self.cw, y0 + self.lh - 2.0);
+            unsafe {
+                rt.FillRectangle(&rect(x0, y0, x1, y1), &b.badge_g);
+                rt.FillRectangle(&rect(x0, y0, x1, y0 + 1.0), &b.focus);
+                rt.FillRectangle(&rect(x0, y1 - 1.0, x1, y1), &b.focus);
+                rt.FillRectangle(&rect(x0, y0, x0 + 1.0, y1), &b.focus);
+                rt.FillRectangle(&rect(x1 - 1.0, y0, x1, y1), &b.focus);
             }
         }
 
