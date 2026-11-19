@@ -262,11 +262,33 @@ impl App {
         }
     }
 
+    /// Lägsta lediga visningsnummer bland öppna namnlösa flikar.
+    fn free_no(&self) -> u64 {
+        let mut used: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter(|t| t.path.is_none())
+            .map(|t| t.no)
+            .collect();
+        used.sort_unstable();
+        let mut n = 1;
+        for u in used {
+            if u == n {
+                n += 1;
+            } else if u > n {
+                break;
+            }
+        }
+        n
+    }
+
     fn new_tab(&mut self) {
         let id = self.next_id;
         self.next_id += 1;
         self.wal.send(Msg::Reset(id, wal::rec_header(0, 0, None)));
-        self.tabs.push(Tab::new(id, None, Doc::empty()));
+        let mut t = Tab::new(id, None, Doc::empty());
+        t.no = self.free_no();
+        self.tabs.push(t);
         self.active = self.tabs.len() - 1;
         self.structural();
     }
@@ -321,6 +343,16 @@ impl App {
     fn close(&mut self, i: usize) {
         if i < self.tabs.len() {
             let t = &self.tabs[i];
+            // Sista fliken som redan är tom och namnlös: att stänga den skulle bara
+            // skapa en likadan (ny WAL-fil och nytt nummer per tangentrepetition).
+            if self.tabs.len() == 1
+                && t.path.is_none()
+                && !t.dirty
+                && !t.loading
+                && t.doc.len() == 0
+            {
+                return;
+            }
             if let Some(p) = &t.path {
                 self.closed.push((p.clone(), t.cursor, t.top));
                 if self.closed.len() > CLOSED_MAX {
@@ -1829,6 +1861,10 @@ fn main() -> Result<()> {
     };
     for (id, job) in rec.jobs {
         app.spawn(id, job);
+    }
+    // Återställda namnlösa flikar numreras 1, 2, 3 … i flikordning.
+    for (k, t) in app.tabs.iter_mut().filter(|t| t.path.is_none()).enumerate() {
+        t.no = k as u64 + 1;
     }
     for a in args() {
         let p = std::fs::canonicalize(&a)

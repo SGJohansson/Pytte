@@ -48,6 +48,9 @@ fn split_term(b: &[u8]) -> (&[u8], &[u8]) {
 
 pub struct Tab {
     pub id: u64,
+    /// Visningsnummer för namnlösa flikar ("namnlös-N"). Skilt från id, som aldrig
+    /// återanvänds; numret är det lägsta lediga bland öppna namnlösa flikar.
+    pub no: u64,
     pub path: Option<String>,
     pub doc: Doc,
     pub cursor: usize,
@@ -72,6 +75,7 @@ impl Tab {
         let crlf = doc.detect_crlf();
         Tab {
             id,
+            no: id,
             path,
             doc,
             cursor: 0,
@@ -98,7 +102,7 @@ impl Tab {
     pub fn title(&self) -> String {
         match &self.path {
             Some(p) => p.rsplit(['\\', '/']).next().unwrap_or(p).to_string(),
-            None => format!("namnlös-{}", self.id),
+            None => format!("namnlös-{}", self.no),
         }
     }
 
