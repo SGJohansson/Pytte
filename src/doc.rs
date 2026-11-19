@@ -1,16 +1,29 @@
-//! Piece table över mmap:ad källfil + append-buffert. Inga radindex:
-//! allt är byteoffset, så öppning är O(1) oavsett filstorlek.
+//! Piece table över mmap:ad källfil + append-only add-buffert.
+//! Allt är byteoffset, så öppning är O(1) oavsett filstorlek.
+//! Varje piece cachar sitt antal '\n' (känt för add-data direkt, för källdata
+//! så fort bakgrundsindexet nått dit) → radnummer är O(pieces) utan filskanning.
 //! Texten tolkas som UTF-8; ogiltiga bytes lämnas orörda och stegas en i taget.
 
-use crate::winfile::Orig;
+use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
+use std::ptr::NonNull;
+use std::sync::Arc;
+
+use crate::orig::{self, CH, Orig, count_nl};
 
 pub const TAB: usize = 4;
+const UNK: u64 = u64::MAX;
+/// Under denna storlek räknas/sökes direkt istället för via index.
+const DIRECT: usize = 2 * CH;
+/// Budget för rå radslutsskanning när indexet ännu inte nått fram (render).
+pub const SCAN_BUDGET: usize = 4 << 20;
 
 #[derive(Clone, Copy)]
 struct Piece {
     add: bool,
     start: usize,
     len: usize,
+    /// Antal '\n' i piecen, eller UNK.
+    nl: u64,
 }
 
 /// Bortklippt intervall som piece-referenser (O(pieces), inte O(bytes)).
@@ -20,11 +33,200 @@ pub struct Removed {
     pub len: usize,
 }
 
+// ---------------------------------------------------------------- add-buffert
+
+const ACH_SHIFT: u32 = 12;
+const ACH: usize = 1 << ACH_SHIFT;
+const SEG_MAX: usize = 1 << 20;
+
+/// Nollställt minne som skrivs en gång per byte och aldrig skrivs om.
+/// Delas med söktrådar via Arc: de läser bara redan skrivna intervall.
+pub struct Seg {
+    ptr: NonNull<u8>,
+    cap: usize,
+}
+
+unsafe impl Send for Seg {}
+unsafe impl Sync for Seg {}
+
+impl Seg {
+    fn new(cap: usize) -> Seg {
+        let layout = Layout::array::<u8>(cap).unwrap();
+        let p = unsafe { alloc_zeroed(layout) };
+        match NonNull::new(p) {
+            Some(ptr) => Seg { ptr, cap },
+            None => handle_alloc_error(layout),
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, a: usize, n: usize) -> &[u8] {
+        assert!(a + n <= self.cap);
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(a), n) }
+    }
+
+    /// Endast Doc (UI-tråden) skriver, och bara i ännu oskrivna intervall.
+    unsafe fn write(&self, a: usize, src: &[u8]) {
+        assert!(a + src.len() <= self.cap);
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.as_ptr().add(a), src.len()) };
+    }
+}
+
+impl Drop for Seg {
+    fn drop(&mut self) {
+        unsafe { dealloc(self.ptr.as_ptr(), Layout::array::<u8>(self.cap).unwrap()) };
+    }
+}
+
+/// Globalt offsetrum uppdelat i ACH-justerade segment; oanvända segmentsvansar
+/// är nollor (inga '\n'). En piece ligger alltid inom ett segment.
+struct AddBuf {
+    segs: Vec<(usize, Arc<Seg>)>,
+    end: usize,
+    /// nl[k] = antal '\n' under k*ACH. Invariant: nl.len() == end/ACH + 1.
+    nl: Vec<u64>,
+    nl_total: u64,
+}
+
+impl AddBuf {
+    fn new() -> AddBuf {
+        AddBuf {
+            segs: Vec::new(),
+            end: 0,
+            nl: vec![0],
+            nl_total: 0,
+        }
+    }
+
+    #[inline]
+    fn seg(&self, x: usize) -> &(usize, Arc<Seg>) {
+        let i = self.segs.partition_point(|s| s.0 <= x);
+        &self.segs[i - 1]
+    }
+
+    /// Bytes [a, a+n) – måste ligga inom ett segment.
+    #[inline]
+    fn get(&self, a: usize, n: usize) -> &[u8] {
+        if n == 0 {
+            return &[];
+        }
+        let (base, s) = self.seg(a);
+        s.get(a - base, n)
+    }
+
+    /// Returnerar (start, nytt segment påbörjat).
+    fn append(&mut self, b: &[u8]) -> (usize, bool) {
+        let n = b.len();
+        let fits = self
+            .segs
+            .last()
+            .is_some_and(|(base, s)| self.end + n <= base + s.cap);
+        if !fits {
+            let (base, prev_cap) = self
+                .segs
+                .last()
+                .map_or((0, 0), |(base, s)| (base + s.cap, s.cap));
+            let cap = (prev_cap * 2)
+                .clamp(ACH, SEG_MAX)
+                .max(n.next_multiple_of(ACH));
+            while self.nl.len() - 1 < base >> ACH_SHIFT {
+                self.nl.push(self.nl_total);
+            }
+            self.end = base;
+            self.segs.push((base, Arc::new(Seg::new(cap))));
+        }
+        let start = self.end;
+        let (base, s) = self.segs.last().unwrap();
+        let fresh = start == *base;
+        unsafe { s.write(start - base, b) };
+        let (mut off, mut pos) = (0, start);
+        while off < n {
+            let next_b = ((pos >> ACH_SHIFT) + 1) << ACH_SHIFT;
+            let take = (next_b - pos).min(n - off);
+            self.nl_total += count_nl(&b[off..off + take]);
+            off += take;
+            pos += take;
+            if pos == next_b {
+                self.nl.push(self.nl_total);
+            }
+        }
+        self.end += n;
+        (start, fresh)
+    }
+
+    /// Antal '\n' under x (x ≤ end).
+    #[inline]
+    fn nl_before(&self, x: usize) -> u64 {
+        let k = x >> ACH_SHIFT;
+        let a = k << ACH_SHIFT;
+        self.nl[k]
+            + if x > a {
+                count_nl(self.get(a, x - a))
+            } else {
+                0
+            }
+    }
+
+    /// Position för det t:e (1-baserade) '\n'.
+    fn find_nl(&self, t: u64) -> Option<usize> {
+        if t == 0 || t > self.nl_total {
+            return None;
+        }
+        let k = self.nl.partition_point(|&c| c < t) - 1;
+        let a = k << ACH_SHIFT;
+        let b = (a + ACH).min(self.end);
+        let skip = (t - self.nl[k] - 1) as usize;
+        memchr::memchr_iter(b'\n', self.get(a, b - a))
+            .nth(skip)
+            .map(|i| a + i)
+    }
+}
+
+// ---------------------------------------------------------------- dokument
+
 pub struct Doc {
     orig: Orig,
-    add: Vec<u8>,
+    add: AddBuf,
     pieces: Vec<Piece>,
     len: usize,
+    /// Det kan finnas pieces med okänt radantal.
+    unresolved: bool,
+    version: u64,
+}
+
+/// Läsbar del av en ögonblicksbild; håller källan vid liv på andra trådar.
+pub enum PartSrc {
+    Orig(Orig),
+    Add(Arc<Seg>),
+}
+
+pub struct Part {
+    src: PartSrc,
+    a: usize,
+    n: usize,
+}
+
+impl Part {
+    #[inline]
+    pub fn bytes(&self) -> &[u8] {
+        match &self.src {
+            PartSrc::Orig(o) => &o.bytes()[self.a..self.a + self.n],
+            PartSrc::Add(s) => s.get(self.a, self.n),
+        }
+    }
+}
+
+/// Oföränderlig vy av dokumentet för bakgrundstrådar. O(pieces) att ta.
+pub struct Snap {
+    pub parts: Vec<Part>,
+    pub len: usize,
+}
+
+/// Radslut efter en position när indexet ännu inte kan svara.
+pub enum Next {
+    At(usize),
+    End,
+    Unknown,
 }
 
 /// Längd på UTF-8-sekvens givet första byte; 0 = ogiltig startbyte.
@@ -52,25 +254,29 @@ fn class(b: u8) -> u8 {
 impl Doc {
     pub fn new(orig: Orig) -> Doc {
         let n = orig.bytes().len();
-        let pieces = if n > 0 {
-            vec![Piece {
+        let mut d = Doc {
+            orig,
+            add: AddBuf::new(),
+            pieces: Vec::new(),
+            len: n,
+            unresolved: false,
+            version: 0,
+        };
+        if n > 0 {
+            let nl = d.nl_range(false, 0, n);
+            d.unresolved = nl == UNK;
+            d.pieces.push(Piece {
                 add: false,
                 start: 0,
                 len: n,
-            }]
-        } else {
-            Vec::new()
-        };
-        Doc {
-            orig,
-            add: Vec::new(),
-            pieces,
-            len: n,
+                nl,
+            });
         }
+        d
     }
 
     pub fn empty() -> Doc {
-        Doc::new(Orig::Empty)
+        Doc::new(orig::empty())
     }
 
     #[inline]
@@ -79,13 +285,180 @@ impl Doc {
     }
 
     #[inline]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn orig(&self) -> &Orig {
+        &self.orig
+    }
+
+    #[inline]
     fn src(&self, p: Piece) -> &[u8] {
-        if p.add {
-            &self.add[p.start..p.start + p.len]
+        self.raw(p.add, p.start, p.start + p.len)
+    }
+
+    #[inline]
+    fn raw(&self, add: bool, a: usize, b: usize) -> &[u8] {
+        if add {
+            self.add.get(a, b - a)
         } else {
-            &self.orig.bytes()[p.start..p.start + p.len]
+            &self.orig.bytes()[a..b]
         }
     }
+
+    // ------------------------------------------------------------ radräkning
+
+    /// Antal '\n' före källposition x, om känt.
+    #[inline]
+    fn before(&self, add: bool, x: usize) -> Option<u64> {
+        if add {
+            Some(self.add.nl_before(x))
+        } else {
+            self.orig.idx.nl_before(self.orig.bytes(), x)
+        }
+    }
+
+    #[inline]
+    fn find_nl(&self, add: bool, t: u64) -> Option<usize> {
+        if add {
+            self.add.find_nl(t)
+        } else {
+            self.orig.idx.find_nl(self.orig.bytes(), t)
+        }
+    }
+
+    /// Antal '\n' i källintervall [a, b), eller UNK.
+    fn nl_range(&self, add: bool, a: usize, b: usize) -> u64 {
+        if b - a <= DIRECT {
+            return count_nl(self.raw(add, a, b));
+        }
+        match (self.before(add, a), self.before(add, b)) {
+            (Some(x), Some(y)) => y - x,
+            _ => UNK,
+        }
+    }
+
+    /// Del av en piece med radantal (återanvänder cachat värde när möjligt).
+    fn sub(&self, p: Piece, off: usize, len: usize) -> Piece {
+        let nl = if off == 0 && len == p.len {
+            p.nl
+        } else {
+            self.nl_range(p.add, p.start + off, p.start + off + len)
+        };
+        Piece {
+            start: p.start + off,
+            len,
+            nl,
+            ..p
+        }
+    }
+
+    fn mark(&mut self, ps: &[Piece]) {
+        if ps.iter().any(|p| p.nl == UNK) {
+            self.unresolved = true;
+        }
+    }
+
+    /// Fyller i radantal som bakgrundsindexet hunnit räkna. Returnerar true om
+    /// något ändrades. Billig när allt redan är känt.
+    pub fn resolve(&mut self) -> bool {
+        if !self.unresolved {
+            return false;
+        }
+        let mut changed = false;
+        let mut still = false;
+        for i in 0..self.pieces.len() {
+            let p = self.pieces[i];
+            if p.nl == UNK {
+                let nl = self.nl_range(p.add, p.start, p.start + p.len);
+                if nl == UNK {
+                    still = true;
+                } else {
+                    self.pieces[i].nl = nl;
+                    changed = true;
+                }
+            }
+        }
+        self.unresolved = still;
+        changed
+    }
+
+    /// 0-baserat radnummer för pos, om känt.
+    pub fn line_of(&self, pos: usize) -> Option<u64> {
+        let mut acc = 0u64;
+        let mut at = 0usize;
+        for p in &self.pieces {
+            if pos < at + p.len {
+                let part = self.nl_range(p.add, p.start, p.start + (pos - at));
+                return (part != UNK).then_some(acc + part);
+            }
+            if p.nl == UNK {
+                return None;
+            }
+            acc += p.nl;
+            at += p.len;
+        }
+        Some(acc)
+    }
+
+    /// Totalt antal rader, om känt.
+    pub fn lines(&self) -> Option<u64> {
+        self.line_of(self.len).map(|n| n + 1)
+    }
+
+    /// Uppskattat radantal (för gutterbredd innan indexet är klart).
+    pub fn est_lines(&self) -> u64 {
+        if let Some(n) = self.lines() {
+            return n;
+        }
+        let (bytes, nl) = self.orig.idx.sample();
+        let avg = if nl > 0 {
+            bytes as f64 / nl as f64
+        } else {
+            32.0
+        };
+        (self.len as f64 / avg.max(1.0) * 1.1) as u64 + 1
+    }
+
+    /// Indexeringsgrad 0–1 för källfilen, None när klar.
+    pub fn index_progress(&self) -> Option<f32> {
+        (!self.orig.idx.complete()).then(|| self.orig.idx.progress())
+    }
+
+    /// Start på 0-baserad rad n, om känd (n bortom sista raden → None).
+    pub fn pos_of_line(&self, n: u64) -> Option<usize> {
+        if n == 0 {
+            return Some(0);
+        }
+        let mut acc = 0u64;
+        let mut at = 0usize;
+        for p in &self.pieces {
+            if p.nl == UNK {
+                // Piecen är inte färdigräknad, men målraden kan ligga i den
+                // redan indexerade början (Ctrl+G under pågående indexering).
+                let i = self
+                    .before(p.add, p.start)
+                    .and_then(|b0| self.find_nl(p.add, b0 + (n - acc)))?;
+                return (i < p.start + p.len).then(|| at + (i - p.start) + 1);
+            }
+            if acc + p.nl >= n {
+                let t = n - acc;
+                let i = if p.len <= DIRECT {
+                    memchr::memchr_iter(b'\n', self.src(*p)).nth(t as usize - 1)?
+                } else {
+                    let b0 = self.before(p.add, p.start)?;
+                    self.find_nl(p.add, b0 + t)? - p.start
+                };
+                return Some(at + i + 1);
+            }
+            acc += p.nl;
+            at += p.len;
+        }
+        None
+    }
+
+    // ------------------------------------------------------------ redigering
 
     /// (piece-index, offset). pos == len → (pieces.len(), 0).
     fn locate(&self, pos: usize) -> (usize, usize) {
@@ -105,17 +478,15 @@ impl Doc {
             self.pieces.splice(pi..pi, new.iter().copied());
         } else {
             let p = self.pieces[pi];
-            let left = Piece { len: off, ..p };
-            let right = Piece {
-                start: p.start + off,
-                len: p.len - off,
-                ..p
-            };
+            let left = self.sub(p, 0, off);
+            let right = self.sub(p, off, p.len - off);
+            self.mark(&[left, right]);
             let mid = std::iter::once(left)
                 .chain(new.iter().copied())
                 .chain(std::iter::once(right));
             self.pieces.splice(pi..pi + 1, mid);
         }
+        self.mark(new);
     }
 
     pub fn insert(&mut self, pos: usize, bytes: &[u8]) {
@@ -123,15 +494,18 @@ impl Doc {
             return;
         }
         debug_assert!(pos <= self.len);
-        let start = self.add.len();
-        self.add.extend_from_slice(bytes);
+        self.version += 1;
+        let (start, fresh_seg) = self.add.append(bytes);
         let n = bytes.len();
+        let nl = count_nl(bytes);
         let (pi, off) = self.locate(pos);
         // Löpande skrivning: förläng föregående add-piece istället för att splitta.
-        if off == 0 && pi > 0 {
+        // Aldrig över en segmentgräns (piecen måste ligga i ett segment).
+        if off == 0 && pi > 0 && !fresh_seg {
             let prev = &mut self.pieces[pi - 1];
             if prev.add && prev.start + prev.len == start {
                 prev.len += n;
+                prev.nl += nl;
                 self.len += n;
                 return;
             }
@@ -142,6 +516,7 @@ impl Doc {
                 add: true,
                 start,
                 len: n,
+                nl,
             }],
         );
         self.len += n;
@@ -156,6 +531,7 @@ impl Doc {
         if n == 0 {
             return removed;
         }
+        self.version += 1;
         let (first, mut off) = self.locate(pos);
         let mut i = first;
         let mut rem = n;
@@ -164,24 +540,17 @@ impl Doc {
             let p = self.pieces[i];
             let take = (p.len - off).min(rem);
             if off > 0 {
-                keep.push(Piece { len: off, ..p });
+                keep.push(self.sub(p, 0, off));
             }
-            removed.pieces.push(Piece {
-                start: p.start + off,
-                len: take,
-                ..p
-            });
+            removed.pieces.push(self.sub(p, off, take));
             if off + take < p.len {
-                keep.push(Piece {
-                    start: p.start + off + take,
-                    len: p.len - off - take,
-                    ..p
-                });
+                keep.push(self.sub(p, off + take, p.len - off - take));
             }
             rem -= take;
             off = 0;
             i += 1;
         }
+        self.mark(&keep);
         self.pieces.splice(first..i, keep);
         self.len -= n;
         removed
@@ -191,6 +560,7 @@ impl Doc {
         if r.len == 0 {
             return;
         }
+        self.version += 1;
         self.splice_at(pos, &r.pieces);
         self.len += r.len;
     }
@@ -221,6 +591,33 @@ impl Doc {
 
     pub fn materialize(&self) -> Vec<u8> {
         self.slice(0, self.len)
+    }
+
+    pub fn snapshot(&self) -> Snap {
+        let parts = self
+            .pieces
+            .iter()
+            .map(|p| {
+                if p.add {
+                    let (base, s) = self.add.seg(p.start);
+                    Part {
+                        src: PartSrc::Add(s.clone()),
+                        a: p.start - base,
+                        n: p.len,
+                    }
+                } else {
+                    Part {
+                        src: PartSrc::Orig(self.orig.clone()),
+                        a: p.start,
+                        n: p.len,
+                    }
+                }
+            })
+            .collect();
+        Snap {
+            parts,
+            len: self.len,
+        }
     }
 
     // ------------------------------------------------------------ iteration
@@ -268,17 +665,108 @@ impl Doc {
 
     // ------------------------------------------------------------ rader
 
-    pub fn line_start(&self, pos: usize) -> usize {
-        match self.back(pos).position(|b| b == b'\n') {
-            Some(k) => pos - k,
-            None => 0,
+    /// Första '\n' i källintervall [a, b). Index när det finns, annars memchr
+    /// (högst `budget` bytes; Err om budgeten tar slut).
+    fn first_nl(
+        &self,
+        add: bool,
+        a: usize,
+        b: usize,
+        budget: &mut usize,
+    ) -> Result<Option<usize>, ()> {
+        if b - a > DIRECT
+            && let Some(ca) = self.before(add, a)
+        {
+            if let Some(cb) = self.before(add, b) {
+                if ca == cb {
+                    return Ok(None);
+                }
+                if let Some(i) = self.find_nl(add, ca + 1) {
+                    return Ok(Some(i));
+                }
+            } else if let Some(i) = self.find_nl(add, ca + 1) {
+                // Nästa kända '\n' efter a; ligger det bortom piecen finns inget i den.
+                return Ok((i < b).then_some(i));
+            }
         }
+        if b - a > *budget {
+            return match memchr::memchr(b'\n', self.raw(add, a, a + *budget)) {
+                Some(i) => Ok(Some(a + i)),
+                None => Err(()),
+            };
+        }
+        *budget -= b - a;
+        Ok(memchr::memchr(b'\n', self.raw(add, a, b)).map(|i| a + i))
+    }
+
+    /// Sista '\n' i källintervall [a, b).
+    fn last_nl(&self, add: bool, a: usize, b: usize) -> Option<usize> {
+        if b - a > DIRECT
+            && let (Some(ca), Some(cb)) = (self.before(add, a), self.before(add, b))
+        {
+            return if ca == cb {
+                None
+            } else {
+                self.find_nl(add, cb)
+            };
+        }
+        memchr::memrchr(b'\n', self.raw(add, a, b)).map(|i| a + i)
+    }
+
+    /// Start på raden efter `pos` med begränsad skanning. Unknown = indexet har
+    /// inte nått fram och budgeten tog slut (renderaren slutar då rita rader).
+    pub fn next_line_bounded(&self, pos: usize, mut budget: usize) -> Next {
+        let (mut pi, mut off) = self.locate(pos);
+        let mut at = pos;
+        while pi < self.pieces.len() {
+            let p = self.pieces[pi];
+            let from = p.start + off;
+            let to = p.start + p.len;
+            match self.first_nl(p.add, from, to, &mut budget) {
+                Ok(Some(i)) => return Next::At(at + (i - from) + 1),
+                Ok(None) => {}
+                Err(()) => return Next::Unknown,
+            }
+            at += to - from;
+            pi += 1;
+            off = 0;
+        }
+        Next::End
+    }
+
+    pub fn next_line_start(&self, pos: usize) -> Option<usize> {
+        match self.next_line_bounded(pos, usize::MAX) {
+            Next::At(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn line_start(&self, pos: usize) -> usize {
+        let (pi, off) = self.locate(pos);
+        let mut at = pos - off;
+        if pi < self.pieces.len() && off > 0 {
+            let p = self.pieces[pi];
+            if let Some(i) = self.last_nl(p.add, p.start, p.start + off) {
+                return at + (i - p.start) + 1;
+            }
+        }
+        for j in (0..pi).rev() {
+            let p = self.pieces[j];
+            at -= p.len;
+            if p.nl == 0 {
+                continue;
+            }
+            if let Some(i) = self.last_nl(p.add, p.start, p.start + p.len) {
+                return at + (i - p.start) + 1;
+            }
+        }
+        0
     }
 
     /// Position för radens terminator (\r i CRLF, annars \n), eller len.
     pub fn line_end(&self, pos: usize) -> usize {
-        let e = match self.fwd(pos).position(|b| b == b'\n') {
-            Some(k) => pos + k,
+        let e = match self.next_line_start(pos) {
+            Some(n) => n - 1,
             None => return self.len,
         };
         if e > pos && self.byte(e - 1) == Some(b'\r') {
@@ -286,10 +774,6 @@ impl Doc {
         } else {
             e
         }
-    }
-
-    pub fn next_line_start(&self, pos: usize) -> Option<usize> {
-        self.fwd(pos).position(|b| b == b'\n').map(|k| pos + k + 1)
     }
 
     pub fn prev_line_start(&self, pos: usize) -> Option<usize> {
@@ -511,9 +995,21 @@ mod tests {
         String::from_utf8(d.materialize()).unwrap()
     }
 
+    fn doc(b: &[u8]) -> Doc {
+        Doc::new(orig::owned(b.to_vec()))
+    }
+
+    fn wait_index(d: &mut Doc) {
+        let t0 = std::time::Instant::now();
+        while d.index_progress().is_some() && t0.elapsed().as_secs() < 10 {
+            std::thread::yield_now();
+        }
+        d.resolve();
+    }
+
     #[test]
     fn edits() {
-        let mut d = Doc::new(Orig::Owned(b"hello\r\nworld".to_vec()));
+        let mut d = doc(b"hello\r\nworld");
         d.insert(5, b"!");
         d.insert(6, b"?");
         assert_eq!(s(&d), "hello!?\r\nworld");
@@ -527,7 +1023,7 @@ mod tests {
 
     #[test]
     fn lines() {
-        let d = Doc::new(Orig::Owned(b"ab\r\n\tc\nxyz".to_vec()));
+        let d = doc(b"ab\r\n\tc\nxyz");
         assert_eq!(d.line_start(5), 4);
         assert_eq!(d.line_end(0), 2);
         assert_eq!(d.next_line_start(0), Some(4));
@@ -539,6 +1035,13 @@ mod tests {
         assert_eq!(d.pos_at_vcol(4, 4), 5);
         assert!(d.detect_crlf());
         assert_eq!(d.next_line_start(7), None);
+        assert_eq!(d.line_of(0), Some(0));
+        assert_eq!(d.line_of(5), Some(1));
+        assert_eq!(d.line_of(10), Some(2));
+        assert_eq!(d.lines(), Some(3));
+        assert_eq!(d.pos_of_line(1), Some(4));
+        assert_eq!(d.pos_of_line(2), Some(7));
+        assert_eq!(d.pos_of_line(3), None);
     }
 
     #[test]
@@ -547,7 +1050,7 @@ mod tests {
         let mut v = "åä€😀x".as_bytes().to_vec();
         v.push(0xff);
         v.push(b'y');
-        let d = Doc::new(Orig::Owned(v));
+        let d = doc(&v);
         let mut p = 0;
         let mut stops = vec![0];
         while p < d.len() {
@@ -565,5 +1068,111 @@ mod tests {
         assert_eq!(d.vcol(11), 4);
         assert_eq!(d.pos_at_vcol(0, 3), 7);
         assert_eq!(d.word_right(0), 14);
+    }
+
+    /// Slumpade redigeringar på stor fil: radfunktionerna ska stämma mot en
+    /// naiv modell oavsett piece-struktur och indexläge.
+    #[test]
+    fn line_model_fuzz() {
+        let mut rng = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % n.max(1) as u64) as usize
+        };
+        let mut base = Vec::new();
+        while base.len() < 3 * CH + 777 {
+            let l = rnd(120);
+            base.extend(std::iter::repeat_n(b'a', l));
+            base.extend_from_slice(if rnd(3) == 0 { b"\r\n" } else { b"\n" });
+        }
+        // Ett jättelångt radlöst block för att tvinga indexvägen.
+        base.extend(std::iter::repeat_n(b'z', 5 * CH));
+        base.extend_from_slice(b"\ntail");
+        let mut d = doc(&base);
+        let mut m = base.clone();
+        wait_index(&mut d);
+        for round in 0..400 {
+            let pos = rnd(m.len() + 1);
+            if rnd(3) == 0 && m.len() > 10 {
+                let n = rnd(300).min(m.len() - pos);
+                d.delete(pos, n);
+                m.drain(pos..pos + n);
+            } else {
+                let mut ins = Vec::new();
+                for _ in 0..rnd(20) {
+                    ins.push(if rnd(4) == 0 { b'\n' } else { b'q' });
+                }
+                if rnd(50) == 0 {
+                    ins.extend(std::iter::repeat_n(b'w', 3 * ACH + 5));
+                    ins.push(b'\n');
+                }
+                d.insert(pos, &ins);
+                m.splice(pos..pos, ins);
+            }
+            d.resolve();
+            if round % 20 != 0 {
+                continue;
+            }
+            assert_eq!(d.materialize(), m);
+            let nl: Vec<usize> = m
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| **b == b'\n')
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(d.lines(), Some(nl.len() as u64 + 1));
+            for _ in 0..30 {
+                let p = rnd(m.len() + 1);
+                let want_line = nl.partition_point(|&i| i < p) as u64;
+                assert_eq!(d.line_of(p), Some(want_line), "line_of {p}");
+                let ls = nl
+                    .get((want_line as usize).wrapping_sub(1))
+                    .map_or(0, |i| i + 1);
+                assert_eq!(d.line_start(p), ls, "line_start {p}");
+                let nx = nl.get(want_line as usize).map(|i| i + 1);
+                assert_eq!(d.next_line_start(p), nx, "next_line_start {p}");
+                assert_eq!(d.pos_of_line(want_line), Some(ls), "pos_of_line");
+            }
+        }
+    }
+
+    #[test]
+    fn typing_across_segment_boundary() {
+        let mut d = doc(b"");
+        let mut m = Vec::new();
+        for i in 0..(3 * SEG_MAX) {
+            let c = if i % 50 == 49 {
+                b'\n'
+            } else {
+                b'a' + (i % 26) as u8
+            };
+            d.insert(d.len(), &[c]);
+            m.push(c);
+        }
+        assert_eq!(d.materialize(), m);
+        assert_eq!(
+            d.lines(),
+            Some(m.iter().filter(|&&b| b == b'\n').count() as u64 + 1)
+        );
+    }
+
+    #[test]
+    fn snapshot_reads_through_segments() {
+        let mut d = doc(b"0123456789");
+        for i in 0..2000 {
+            let pos = (i * 7) % (d.len() + 1);
+            d.insert(pos, format!("<{i}>").as_bytes());
+        }
+        let big = vec![b'B'; SEG_MAX + 10];
+        d.insert(3, &big);
+        let snap = d.snapshot();
+        let mut v = Vec::new();
+        for p in &snap.parts {
+            v.extend_from_slice(p.bytes());
+        }
+        assert_eq!(v, d.materialize());
+        assert_eq!(snap.len, d.len());
     }
 }

@@ -4,11 +4,15 @@ A multi-tab plaintext editor for Windows where two things come before everything
 
 I built Pytte because Linux is well served by fast editors and Windows mostly is not. The rule from day one: the UI thread never waits for the disk, and nothing that slows down the core gets in until the core is proven.
 
-> **Status:** early prototype (v0.1). Windows 10/11 only. The interface is in Swedish.
+> **Status:** early prototype (v0.2). Windows 10/11 only. The interface is in Swedish.
 
 ## Features
 
-- **Instant open, whatever the size** — files are memory-mapped, not read. There is no line index to build, so opening and scrolling cost the same for 2 KB and 2 GB. Opening runs on a background thread; the tab appears at once and fills in when ready.
+- **Instant open, whatever the size** — files are memory-mapped, not read. Opening runs on a background thread; the tab appears at once and fills in when ready, and costs the same for 2 KB and 2 GB.
+- **Line numbers without the wait** — a line index is counted on its own thread, 64 KiB at a time, and published lock-free; the first MiB is counted before the tab is shown, so ordinary files have exact numbers on the first frame. A gigabyte is indexed in a fraction of a second; until then the gutter shows `~` and the status bar the progress. The UI thread never scans the file, and the gutter only ever grows, so the layout never jumps.
+- **Search** — `Ctrl+F` searches as you type, on a worker thread that can be cancelled, with matches streamed back and highlighted on screen. SIMD substring search; case-insensitive mode folds ASCII and Latin-1 (`åäö`, `é`, `ü`). Matches that straddle edits are found too.
+- **Line operations** — duplicate, move and delete whole lines; each is a single undo step.
+- **Status bar** — saved/changed state, line and column, line count, selection size, line endings and file size. Segments shorten or drop out in order of importance rather than overlap; nothing is ever drawn on top of text.
 - **Crash-proof sessions** — every edit is appended to a per-tab write-ahead log on its own thread, written through to disk, with a CRC on every record. Close the window and nothing is asked: tabs, cursor positions and unsaved text are restored on the next start. A torn last record after a power cut is detected and cut off.
 - **Safe saves** — written to a temporary file, flushed, then swapped in with `ReplaceFileW`, so the file on disk is always either the old or the new version, never half of each.
 - **Tabs** — open as many as you like; switching is O(1) and only the visible lines are ever drawn. Opening a file that is already open just switches to it.
@@ -41,6 +45,7 @@ I built Pytte because Linux is well served by fast editors and Windows mostly is
 | Click · drag · `Shift`+click | Place the cursor · select · extend the selection |
 | Mouse wheel | Scroll |
 | `Ctrl+A` · `Esc` | Select all · clear the selection |
+| `Ctrl+G` | Go to line |
 
 **Editing**
 
@@ -50,6 +55,18 @@ I built Pytte because Linux is well served by fast editors and Windows mostly is
 | `Ctrl+Backspace` / `Ctrl+Delete` | Delete a word |
 | `Ctrl+C` (`Ctrl+Insert`) · `Ctrl+X` · `Ctrl+V` | Copy · cut · paste |
 | `Ctrl+Z` · `Ctrl+Y` (`Ctrl+Shift+Z`) | Undo · redo |
+| `Ctrl+D` | Duplicate line(s) |
+| `Alt+↑` / `Alt+↓` | Move line(s) up / down |
+| `Ctrl+Shift+K` | Delete line(s) |
+
+**Search**
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl+F` | Open the search bar (a short selection is filled in) |
+| `Enter` / `F3` · `Shift+Enter` / `Shift+F3` | Next · previous match, wrapping around |
+| `Alt+C` | Toggle case sensitivity |
+| `Esc` | Close the search bar |
 
 ## Installation
 
@@ -92,22 +109,22 @@ How it avoids losing data:
 | Part | Choice |
 |---|---|
 | Language | Rust, with Microsoft's [`windows`](https://github.com/microsoft/windows-rs) crate; no UI framework |
-| Text | Piece table over the memory-mapped file plus an append-only buffer; byte offsets throughout, no line index |
+| Text | Piece table over the memory-mapped file plus an append-only buffer; byte offsets throughout. Each piece caches its newline count, backed by a background line index, so line numbers cost O(pieces) |
 | Rendering | Direct2D + DirectWrite, virtualised from the first visible line |
-| I/O | Loader threads for opening, one writer thread for the log; the UI thread only sends messages |
+| I/O | Loader threads for opening, an index thread per file, a search thread, one writer thread for the log; the UI thread only sends messages |
 
 ## Known limitations
 
 - Undo history is cleared when a tab is saved.
 - Saving still runs on the UI thread; saving a multi-gigabyte file freezes the window for a few seconds.
-- Lines that are several gigabytes long are slow to move around in.
-- No line numbers, search, word wrap or double-click word selection yet.
+- Lines that are several gigabytes long are slow to move around in, and the column number is counted from the start of the line.
+- Case-insensitive search folds ASCII and Latin-1 only; regular expressions are not supported yet.
+- No word wrap or double-click word selection yet.
 
 ## Roadmap
 
 - Saving on a background thread
-- A line index built in the background: line numbers, `Ctrl+G`, fast navigation in huge single-line files
-- Search, with results streamed from a worker thread
+- Run the current file with its associated program (`Ctrl+R`)
 - D3D11 and a glyph atlas in place of Direct2D, for an even faster cold start
 - Phase 2, once the core is proven: syntax highlighting, LSP and plugins, always loaded asynchronously and never on the core's path
 
