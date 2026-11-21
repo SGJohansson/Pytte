@@ -160,6 +160,10 @@ pub struct View<'a> {
     pub wal_failed: bool,
     pub bar: Option<BarView<'a>>,
     pub matcher: Option<&'a Matcher>,
+    /// Rita stavfel.
+    pub spell: bool,
+    /// Statusradens stavningssegment ("STAV SV+EN", "STAV AV" …).
+    pub spell_label: &'a str,
 }
 
 /// Statusradssegment. Lägre prio behålls längst.
@@ -442,7 +446,7 @@ impl Gfx {
             rt.BeginDraw();
             rt.Clear(Some(&col(BG, 1.0)));
             hits = self.draw_tabs(rt, &res.b, &l, tabs, active);
-            self.draw_text(rt, &res.b, &l, t, v.matcher);
+            self.draw_text(rt, &res.b, &l, t, v.matcher, v.spell);
             if let Some(bar) = &v.bar {
                 self.draw_bar(rt, &res.b, &l, bar);
             }
@@ -638,6 +642,7 @@ impl Gfx {
         l: &Layout,
         t: &Tab,
         matcher: Option<&Matcher>,
+        spell: bool,
     ) {
         let d = &t.doc;
         let text_bottom = l.y0 + l.rows as f32 * self.lh;
@@ -675,6 +680,8 @@ impl Gfx {
         let mut buf: Vec<u16> = Vec::with_capacity(l.cols * 2 + 2);
         let mut mr: Vec<(usize, usize)> = Vec::new();
         let mut mcols: Vec<(usize, usize, bool)> = Vec::new();
+        let mut sr: Vec<(usize, usize)> = Vec::new();
+        let mut scols: Vec<(usize, usize)> = Vec::new();
         let max_scan = (t.hscroll + l.cols) * 4 + 4096;
         // Rå radslutsskanning (oindexerat område) delar en budget per frame.
         let mut budget = 2 * SCAN_BUDGET;
@@ -725,12 +732,31 @@ impl Gfx {
                 });
             }
 
+            // ---- stavfel på raden. Ordet som skrivs just nu (markören i slutet) väntar.
+            sr.clear();
+            scols.clear();
+            if spell && !t.spell.list.is_empty() {
+                let lim = next.unwrap_or(ls + max_scan);
+                let i0 = t.spell.list.partition_point(|m| m.1 <= ls);
+                for &(s, e) in &t.spell.list[i0..] {
+                    if s >= lim || sr.len() >= 512 {
+                        break;
+                    }
+                    if sel.is_none() && e == t.cursor {
+                        continue;
+                    }
+                    sr.push((s, e));
+                }
+            }
+
             // ---- tecken → kolumner
             buf.clear();
             let (mut c, mut p) = (0usize, ls);
             let (mut s0, mut s1): (Option<usize>, Option<usize>) = (None, None);
             let mut mi = 0usize;
             let mut m0: Option<usize> = None;
+            let mut si = 0usize;
+            let mut sp0: Option<usize> = None;
             let mut eol = false;
             let mut chars = d.chars(ls);
             loop {
@@ -760,6 +786,22 @@ impl Gfx {
                     if p >= me {
                         mcols.push((m0.take().unwrap(), c, sel == Some((ms, me))));
                         mi += 1;
+                        continue;
+                    }
+                    break;
+                }
+                while si < sr.len() {
+                    let (ss, se) = sr[si];
+                    if sp0.is_none() {
+                        if p >= ss {
+                            sp0 = Some(c);
+                        } else {
+                            break;
+                        }
+                    }
+                    if p >= se {
+                        scols.push((sp0.take().unwrap(), c));
+                        si += 1;
                         continue;
                     }
                     break;
@@ -808,6 +850,9 @@ impl Gfx {
                 let cur = mr.get(mi).is_some_and(|&r| sel == Some(r));
                 mcols.push((c0, c, cur));
             }
+            if let Some(c0) = sp0 {
+                scols.push((c0, c));
+            }
             if s0.is_some() && s1.is_none() {
                 // Markeringen fortsätter förbi radslutet (eller utanför skärmen).
                 s1 = Some(if eol { c + 1 } else { c });
@@ -828,6 +873,11 @@ impl Gfx {
                     && c1 > t.hscroll
                 {
                     rt.FillRectangle(&rect(xc(c0), ry, xc(c1), ry + self.lh), &b.sel);
+                }
+                for &(c0, c1) in &scols {
+                    if c1 > t.hscroll {
+                        self.squiggle(rt, xc(c0), xc(c1), ry + self.lh - 1.0, &b.red2);
+                    }
                 }
             }
             self.text(rt, &buf, l.tx, ry, &self.mono, &b.text);
@@ -878,6 +928,30 @@ impl Gfx {
                     rt.FillRectangle(&rect(cx, cy + 2.0, cx + 2.0, cy + self.lh - 2.0), &b.green);
                 }
             }
+        }
+    }
+
+    /// Vågig understrykning [x0, x1) med nederkant `y`. Ritas före texten så
+    /// att den aldrig täcker ett tecken.
+    unsafe fn squiggle(
+        &self,
+        rt: &ID2D1HwndRenderTarget,
+        x0: f32,
+        x1: f32,
+        y: f32,
+        br: &ID2D1SolidColorBrush,
+    ) {
+        const STEP: f32 = 2.0;
+        let mut x = x0;
+        let mut up = false;
+        while x < x1 {
+            let xe = (x + STEP).min(x1);
+            let yt = if up { y - 2.5 } else { y - 1.5 };
+            unsafe {
+                rt.FillRectangle(&rect(x, yt, xe, yt + 1.25), br);
+            }
+            up = !up;
+            x = xe;
         }
     }
 
@@ -1056,6 +1130,12 @@ impl Gfx {
                 fg: &b.muted,
                 badge: None,
                 prio: 3,
+            });
+            segs.push(StatSeg {
+                text: v.spell_label.into(),
+                fg: &b.muted,
+                badge: None,
+                prio: 4,
             });
             segs.push(StatSeg {
                 text: "UTF-8".into(),

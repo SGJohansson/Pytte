@@ -4,7 +4,7 @@ A multi-tab plaintext editor for Windows where two things come before everything
 
 I built Pytte because Linux is well served by fast editors and Windows mostly is not. The rule from day one: the UI thread never waits for the disk, and nothing that slows down the core gets in until the core is proven.
 
-> **Status:** early prototype (v0.3). Windows 10/11 only. The interface is in Swedish.
+> **Status:** early prototype (v0.4). Windows 10/11 only. The interface is in Swedish.
 
 ## Features
 
@@ -13,6 +13,7 @@ I built Pytte because Linux is well served by fast editors and Windows mostly is
 - **Search** — `Ctrl+F` searches as you type, on a worker thread that can be cancelled, with matches streamed back and highlighted on screen. SIMD substring search; case-insensitive mode folds ASCII and Latin-1 (`åäö`, `é`, `ü`). Matches that straddle edits are found too.
 - **Line operations** — duplicate, move and delete whole lines; each is a single undo step.
 - **Reading aids** — the current line is faintly highlighted and the bracket matching the one at the cursor is boxed; the search is capped at 64 KiB each way, so it never scans a large file.
+- **Spell checking with Windows' own checker** — words you type are checked against the dictionaries and languages installed in Windows (your locale, keyboard languages and display language; a word is flagged only if it is wrong in all of them, so mixed Swedish and English is fine). Only text you type or paste is checked, on its own thread, never existing text, so the cost does not depend on the file's size. Misspelled words get a wavy underline drawn beneath the text; right-click one for suggestions, *Add to dictionary* or *Ignore*. `F7` turns it on and off.
 - **Status bar** — saved/changed state, line and column, line count, selection size, line endings and file size. Segments shorten or drop out in order of importance rather than overlap; nothing is ever drawn on top of text.
 - **Crash-proof sessions** — every edit is appended to a per-tab write-ahead log on its own thread, written through to disk, with a CRC on every record. Close the window and nothing is asked: tabs, cursor positions and unsaved text are restored on the next start. A torn last record after a power cut is detected and cut off.
 - **Safe saves** — written to a temporary file, flushed, then swapped in with `ReplaceFileW`, so the file on disk is always either the old or the new version, never half of each.
@@ -63,6 +64,7 @@ I built Pytte because Linux is well served by fast editors and Windows mostly is
 | `Ctrl+D` | Duplicate line(s) |
 | `Alt+↑` / `Alt+↓` | Move line(s) up / down |
 | `Ctrl+Shift+K` | Delete line(s) |
+| `F7` · right-click a misspelled word | Spell checking on/off · suggestions |
 
 **Search**
 

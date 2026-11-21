@@ -5,6 +5,8 @@ mod editor;
 mod orig;
 mod render;
 mod search;
+mod spell;
+mod spellcore;
 mod wal;
 mod winfile;
 
@@ -16,9 +18,9 @@ use std::time::Instant;
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
-use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
+use windows::Win32::Graphics::Gdi::{ClientToScreen, InvalidateRect, ValidateRect};
 use windows::Win32::System::DataExchange::*;
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Controls::Dialogs::*;
@@ -33,12 +35,16 @@ use doc::Doc;
 use editor::{Job, Kind, Outcome, Tab};
 use render::{BarView, Gfx, Layout, View};
 use search::{Batch, Matcher};
+use spell::{Ask, Req, Res, Spell};
 use wal::{Msg, Wal};
 use winfile::{open_orig, wide};
 
 const CLASS: PCWSTR = w!("PytteEditor");
 const WM_LOADED: u32 = WM_APP + 1;
 const WM_SEARCH: u32 = WM_APP + 2;
+const WM_SPELL: u32 = WM_APP + 3;
+const MENU_ADD: usize = 1000;
+const MENU_IGNORE: usize = 1001;
 /// Synkront sökfönster runt markören (för omedelbart svar innan bakgrundssökningen hunnit dit).
 const LOCAL_WIN: usize = 1 << 20;
 const CLOSED_MAX: usize = 50;
@@ -126,6 +132,23 @@ struct App {
     closed: Vec<(String, usize, usize)>,
     /// Klickräkning för dubbel-/trippelklick: (tid ms, x, y, antal).
     clicks: (u32, f32, f32, u8),
+    spell: Spell,
+    /// F7 slår av och på.
+    spell_on: bool,
+    /// Språk som stavningskontrollen använder. None = startar, tom = finns inte.
+    spell_langs: Option<Vec<String>>,
+}
+
+/// Stavningsmeny som visas utanför lånet av App (TrackPopupMenu är modal).
+#[derive(Default)]
+struct SpellMenu {
+    tab: u64,
+    seq: u64,
+    range: (usize, usize),
+    word: String,
+    list: Vec<String>,
+    x: i32,
+    y: i32,
 }
 
 impl App {
@@ -156,6 +179,7 @@ impl App {
     }
 
     fn follow(&mut self) {
+        self.spell_flush();
         let (r, c) = self.rows_cols();
         self.tab().ensure_visible(r, c);
         self.man_dirty = true;
@@ -587,6 +611,10 @@ impl App {
             }
             VK_F3 => {
                 self.find_step(!shift);
+                return None;
+            }
+            VK_F7 if !ctrl && !shift && !alt => {
+                self.spell_toggle();
                 return None;
             }
             _ => {}
@@ -1203,6 +1231,190 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------ stavning
+
+    /// Skickar det som redigerats sedan sist till stavningstråden.
+    fn spell_flush(&mut self) {
+        let t = &mut self.tabs[self.active];
+        if !self.spell_on || t.loading || self.spell_langs.as_ref().is_some_and(|l| l.is_empty()) {
+            t.spell.discard_dirty();
+            return;
+        }
+        let dirty = t.spell.take_dirty();
+        let d = &t.doc;
+        for (a, z) in dirty {
+            let len = d.len();
+            let (a, z) = (a.min(len), z.min(len));
+            for span in spellcore::spans(len, a, z, |p| d.byte(p)) {
+                if span.hi <= span.lo {
+                    continue;
+                }
+                let text = d.slice(span.lo, span.hi);
+                if text.iter().all(|b| b.is_ascii_whitespace()) {
+                    continue;
+                }
+                self.spell.send(Req::Check {
+                    tab: t.id,
+                    seq: t.spell.seq(),
+                    span,
+                    text,
+                });
+            }
+        }
+    }
+
+    fn spell_toggle(&mut self) {
+        self.spell_on = !self.spell_on;
+        for t in &mut self.tabs {
+            t.spell.discard_dirty();
+        }
+        let msg = match (&self.spell_langs, self.spell_on) {
+            (_, false) => "STAVNINGSKONTROLL AV (F7)".to_string(),
+            (Some(l), true) if l.is_empty() => {
+                "STAVNINGSKONTROLL SAKNAS: LÄGG TILL ETT SPRÅK I WINDOWS INSTÄLLNINGAR".to_string()
+            }
+            (_, true) => "STAVNINGSKONTROLL PÅ (F7) · GÄLLER TEXT DU SKRIVER".to_string(),
+        };
+        self.set_status(msg, false);
+    }
+
+    fn spell_label(&self) -> String {
+        if !self.spell_on {
+            return "STAV AV".into();
+        }
+        match &self.spell_langs {
+            None => "STAV …".into(),
+            Some(l) if l.is_empty() => "STAV –".into(),
+            Some(l) => {
+                let mut short: Vec<String> = Vec::new();
+                for t in l {
+                    let s = t.split(['-', '_']).next().unwrap_or(t).to_uppercase();
+                    if !short.contains(&s) {
+                        short.push(s);
+                    }
+                }
+                format!("STAV {}", short.join("+"))
+            }
+        }
+    }
+
+    /// Svar från stavningstråden. Returnerar en meny att visa (högerklick).
+    fn on_spell(&mut self) -> Option<SpellMenu> {
+        let mut menu = None;
+        while let Ok(r) = self.spell.rx.try_recv() {
+            match r {
+                Res::Ready(tags) => {
+                    self.spell_langs = Some(tags);
+                    self.invalidate();
+                }
+                Res::Checked { tab, c } => {
+                    if let Some(i) = self.tabs.iter().position(|t| t.id == tab)
+                        && self.tabs[i].spell.apply(c)
+                        && i == self.active
+                    {
+                        self.invalidate();
+                    }
+                }
+                Res::Suggest(a, list) => {
+                    let Some(t) = self.tabs.get(self.active).filter(|t| t.id == a.tab) else {
+                        continue;
+                    };
+                    let Some(range) = t.spell.map(a.seq, a.range) else {
+                        continue;
+                    };
+                    if t.doc.slice(range.0, range.1) != a.word.as_bytes() {
+                        continue;
+                    }
+                    menu = Some(SpellMenu {
+                        tab: a.tab,
+                        seq: t.spell.seq(),
+                        range,
+                        word: a.word,
+                        list,
+                        x: a.x,
+                        y: a.y,
+                    });
+                }
+            }
+        }
+        menu
+    }
+
+    /// Högerklick på ett stavfel ber om förslag; menyn visas när de kommer.
+    fn on_right(&mut self, lp: LPARAM) {
+        if !self.spell_on {
+            return;
+        }
+        let (x, y) = self.to_dip(lp);
+        let l = self.layout();
+        if y < l.y0 || y >= l.bar_y || x < l.tx || self.tabs[self.active].loading {
+            return;
+        }
+        let pos = self.hit(x, y);
+        let t = &self.tabs[self.active];
+        let Some(range) = t.spell.at(pos) else { return };
+        let word = t.doc.slice(range.0, range.1);
+        let Ok(word) = String::from_utf8(word) else {
+            return;
+        };
+        let mut pt = POINT {
+            x: (lp.0 & 0xffff) as i16 as i32,
+            y: ((lp.0 >> 16) & 0xffff) as i16 as i32,
+        };
+        unsafe {
+            let _ = ClientToScreen(self.hwnd, &mut pt);
+        }
+        self.spell.send(Req::Suggest(Ask {
+            tab: t.id,
+            seq: t.spell.seq(),
+            range,
+            word,
+            x: pt.x,
+            y: pt.y,
+        }));
+    }
+
+    /// Val i stavningsmenyn: 1.. = förslag, MENU_ADD, MENU_IGNORE.
+    fn spell_pick(&mut self, m: SpellMenu, id: usize) {
+        match id {
+            MENU_ADD => {
+                self.spell.send(Req::Add(m.word.clone()));
+                self.drop_word(m.word.as_bytes());
+            }
+            MENU_IGNORE => {
+                self.spell.send(Req::Ignore(m.word.clone()));
+                self.drop_word(m.word.as_bytes());
+            }
+            i if (1..=m.list.len()).contains(&i) => {
+                let Some(t) = self.tabs.get_mut(self.active).filter(|t| t.id == m.tab) else {
+                    return;
+                };
+                let Some(r) = t.spell.map(m.seq, m.range) else {
+                    return;
+                };
+                if t.doc.slice(r.0, r.1) != m.word.as_bytes() {
+                    return;
+                }
+                t.anchor = None;
+                t.seal();
+                self.edit(Some(r), m.list[i - 1].as_bytes(), Kind::Other);
+                self.tab().seal();
+            }
+            _ => {}
+        }
+    }
+
+    /// Tar bort stavfel för `word` i alla flikar (tillagt eller ignorerat).
+    fn drop_word(&mut self, word: &[u8]) {
+        for t in &mut self.tabs {
+            let d = &t.doc;
+            t.spell
+                .list
+                .retain(|&(s, e)| e - s != word.len() || d.slice(s, e) != word);
+        }
+        self.invalidate();
+    }
+
     // ------------------------------------------------------------ mus
 
     fn to_dip(&self, lp: LPARAM) -> (f32, f32) {
@@ -1361,6 +1573,8 @@ impl App {
             wal_failed: self.wal.has_failed(),
             bar,
             matcher: self.search.matcher.as_deref(),
+            spell: self.spell_on,
+            spell_label: &self.spell_label(),
         };
         self.hits = self.gfx.draw(self.hwnd, &self.tabs, self.active, &v);
         if let Some(t0) = self.t0.take()
@@ -1544,6 +1758,56 @@ fn run_cmd(hwnd: HWND, cmd: Cmd) {
     }
 }
 
+/// Visar stavningsmenyn och returnerar valt id (0 = inget).
+fn spell_menu(hwnd: HWND, m: &SpellMenu) -> usize {
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return 0;
+        };
+        if m.list.is_empty() {
+            let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w!("Inga förslag"));
+        }
+        for (i, s) in m.list.iter().enumerate() {
+            let w = wide(s);
+            let _ = AppendMenuW(menu, MF_STRING, i + 1, PCWSTR(w.as_ptr()));
+        }
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let add = wide(&format!("Lägg till \"{}\" i ordlistan", m.word));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_ADD, PCWSTR(add.as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_IGNORE, w!("Ignorera"));
+        let id = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN,
+            m.x,
+            m.y,
+            None,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+        id.0.max(0) as usize
+    }
+}
+
+/// Mörka popupmenyer (samma som Utforskarens mörka läge). Odokumenterat i
+/// uxtheme; saknas funktionerna blir menyn bara ljus.
+fn dark_menus() {
+    unsafe {
+        let Ok(ux) = LoadLibraryW(w!("uxtheme.dll")) else {
+            return;
+        };
+        // Ordinal 135: SetPreferredAppMode(ForceDark = 2), 136: FlushMenuThemes.
+        if let Some(f) = GetProcAddress(ux, PCSTR(std::ptr::without_provenance(135))) {
+            let set: extern "system" fn(i32) -> i32 = std::mem::transmute(f);
+            set(2);
+        }
+        if let Some(f) = GetProcAddress(ux, PCSTR(std::ptr::without_provenance(136))) {
+            let flush: extern "system" fn() = std::mem::transmute(f);
+            flush();
+        }
+    }
+}
+
 // ---------------------------------------------------------------- fönster
 
 fn down(vk: VIRTUAL_KEY) -> bool {
@@ -1661,6 +1925,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         }
         WM_SEARCH => {
             with_app(|a| a.on_search());
+            return LRESULT(0);
+        }
+        WM_SPELL => {
+            if let Some(m) = with_app(|a| a.on_spell()) {
+                let id = spell_menu(hwnd, &m);
+                if id != 0 {
+                    with_app(|a| a.spell_pick(m, id));
+                }
+            }
+            return LRESULT(0);
+        }
+        WM_RBUTTONUP => {
+            with_app(|a| a.on_right(lp));
             return LRESULT(0);
         }
         WM_LOADED => {
@@ -1817,6 +2094,7 @@ fn main() -> Result<()> {
         );
         hwnd
     };
+    dark_menus();
 
     let (load_tx, load_rx) = mpsc::channel();
     let (s_tx, s_rx) = mpsc::channel();
@@ -1858,6 +2136,9 @@ fn main() -> Result<()> {
         posted: Arc::new(AtomicBool::new(false)),
         closed: Vec::new(),
         clicks: (0, 0.0, 0.0, 0),
+        spell: Spell::start(hwnd, WM_SPELL),
+        spell_on: true,
+        spell_langs: None,
     };
     for (id, job) in rec.jobs {
         app.spawn(id, job);
