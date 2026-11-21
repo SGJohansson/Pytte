@@ -1,6 +1,6 @@
 [package]
 name = "pytte"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "A crash-proof multi-tab plaintext editor for Windows, built for raw speed"
 license = "MIT"
@@ -23,9 +23,11 @@ features = [
     "Win32_Graphics_DirectWrite",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Globalization",
     "Win32_Graphics_Dwm",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_IO",
     "Win32_System_Memory",
     "Win32_System_LibraryLoader",

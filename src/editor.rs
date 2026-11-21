@@ -4,6 +4,7 @@
 use std::fs;
 
 use crate::doc::{Doc, Removed};
+use crate::spellcore::Marks;
 use crate::wal::{self, Msg, Op, Parsed, Wal};
 use crate::winfile::open_orig;
 
@@ -44,6 +45,19 @@ fn split_term(b: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
+/// Ny `top` efter att [a, b) ersatts med `ins` byte. Text som infogas exakt vid
+/// `top` hamnar i vyn: annars gömmer Enter på första synliga raden raden ovanför
+/// och ett nytt dokument visar bara sista raden.
+fn shifted_top(top: usize, a: usize, b: usize, ins: usize) -> usize {
+    if b < top {
+        top - (b - a) + ins
+    } else if a < top {
+        a
+    } else {
+        top
+    }
+}
+
 // ---------------------------------------------------------------- flik
 
 pub struct Tab {
@@ -68,6 +82,8 @@ pub struct Tab {
     redo: Vec<Group>,
     /// Nästa redigering startar en ny ångra-grupp.
     sealed: bool,
+    /// Stavfel och ännu okontrollerade redigeringar.
+    pub spell: Marks,
 }
 
 impl Tab {
@@ -90,6 +106,7 @@ impl Tab {
             undo: Vec::new(),
             redo: Vec::new(),
             sealed: true,
+            spell: Marks::default(),
         }
     }
 
@@ -197,25 +214,19 @@ impl Tab {
 
     // ------------------------------------------------------------ primitiv (loggar till WAL)
 
-    fn shift_top(&mut self, a: usize, b: usize, ins: usize) {
-        if b <= self.top {
-            self.top = self.top - (b - a) + ins;
-        } else if a < self.top {
-            self.top = a;
-        }
-    }
-
     fn raw_delete(&mut self, wal: &Wal, a: usize, b: usize) -> Removed {
         let r = self.doc.delete(a, b - a);
         wal.send(Msg::Append(self.id, wal::rec_del(a, b - a)));
-        self.shift_top(a, b, 0);
+        self.top = shifted_top(self.top, a, b, 0);
+        self.spell.edit(a, b, 0);
         r
     }
 
     fn raw_insert(&mut self, wal: &Wal, pos: usize, bytes: &[u8]) {
         self.doc.insert(pos, bytes);
         wal.send(Msg::Append(self.id, wal::rec_ins(pos, bytes)));
-        self.shift_top(pos, pos, bytes.len());
+        self.top = shifted_top(self.top, pos, pos, bytes.len());
+        self.spell.edit(pos, pos, bytes.len());
     }
 
     fn raw_insert_removed(&mut self, wal: &Wal, pos: usize, r: &Removed) {
@@ -224,7 +235,8 @@ impl Tab {
             self.id,
             wal::rec_ins(pos, &self.doc.removed_bytes(r)),
         ));
-        self.shift_top(pos, pos, r.len);
+        self.top = shifted_top(self.top, pos, pos, r.len);
+        self.spell.edit(pos, pos, r.len);
     }
 
     fn settle(&mut self) {
@@ -689,4 +701,25 @@ pub fn recover(dir: &str) -> Recovered {
         out.tabs.push(t);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shifted_top;
+
+    #[test]
+    fn top_stays_on_insert_at_top() {
+        // Enter i ett tomt dokument: vyn ska inte följa med nedåt.
+        assert_eq!(shifted_top(0, 0, 0, 1), 0);
+        assert_eq!(shifted_top(10, 10, 10, 2), 10);
+        // Infogning före top flyttar top.
+        assert_eq!(shifted_top(10, 4, 4, 3), 13);
+        // Radering som slutar vid eller korsar top landar i a.
+        assert_eq!(shifted_top(10, 6, 10, 0), 6);
+        assert_eq!(shifted_top(10, 6, 12, 0), 6);
+        // Radering före top flyttar top.
+        assert_eq!(shifted_top(10, 2, 5, 0), 7);
+        // Ändringar efter top rör den inte.
+        assert_eq!(shifted_top(10, 12, 15, 4), 10);
+    }
 }
